@@ -1,0 +1,25 @@
+{
+  "name": "claw-memory",
+  "version": "1.0.0",
+  "description": "Claw 极限记忆优化方案 - SimHash + SQLite",
+  "memory_dir": "~/.workbuddy/memory",
+  "db_path": "~/.workbuddy/memory/simhash.db",
+  "raw_dir": "~/.workbuddy/memory/raw",
+  "archive": {
+    "triggers": {
+      "max_turns": 15,
+      "context_threshold": 0.7,
+      "session_timeout_minutes": 30
+    },
+    "simhash_width": 64,
+    "hamming_key_bits": 16
+  },
+  "recall": {
+    "top_k": 3,
+    "hamming_threshold": 3,
+    "expand_threshold": 5
+  },
+  "keywords": {
+    "recall": ["回忆", "之前", "历史上", "查一下", "之前我们"]
+  }
+}
