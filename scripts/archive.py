@@ -1,123 +1,93 @@
 #!/usr/bin/env python3
-"""
-archive.py — 归档脚本：将对话历史写入 SQLite + Markdown 分片
-
-功能：
-1. 计算对话的 SimHash 指纹
-2. 写入 simhash.db（指纹 + 元数据）
-3. 追加原文到 raw/YYYY-MM-DD.md
-
-使用方式：
-    python3 archive.py "对话内容" [摘要]
-
-示例：
-    python3 archive.py "这是一个关于 OpenClaw 记忆优化的讨论" "讨论了记忆架构"
-"""
-
+"""归档当前对话到 SQLite + Markdown 分片（V2：含 Parent_ID 链表）"""
 import sys
 import sqlite3
-from datetime import datetime
+import json
 from pathlib import Path
+from datetime import datetime
+from simhash_core import compute_simhash, compute_instruction_hash, hamming_key
 
-# 导入核心算法
-from simhash_core import compute_simhash, hamming_key
-
-# ========== 配置 ==========
-# 默认路径，可通过环境变量覆盖
 MEMORY_DIR = Path.home() / ".workbuddy" / "memory"
 DB_PATH = MEMORY_DIR / "simhash.db"
 RAW_DIR = MEMORY_DIR / "raw"
-
-# 确保目录存在
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def init_db():
-    """初始化 SQLite 表结构"""
+def get_last_simhash(session_id: str) -> int | None:
+    """查询上一轮对话的 SimHash，用于填入 Parent_ID"""
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memory_index (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            simhash     INTEGER NOT NULL,
-            hamming_key TEXT NOT NULL,
-            date        TEXT NOT NULL,
-            source_file TEXT NOT NULL,
-            summary     TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_hamming_key ON memory_index(hamming_key)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_simhash ON memory_index(simhash)")
-    conn.commit()
-    return conn
+    row = conn.execute(
+        "SELECT simhash FROM memory_index WHERE session_id=? ORDER BY id DESC LIMIT 1",
+        (session_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
-def archive_dialogue(dialogue_text: str, summary: str = "") -> dict:
+def archive_dialogue(
+    dialogue_text: str,
+    instruction_text: str,
+    session_id: str,
+    summary: str = ""
+):
     """
-    归档一条对话记录。
-
-    Args:
-        dialogue_text: 原始对话内容
-        summary: 可选摘要（<= 140 字）
-
-    Returns:
-        dict: 归档结果（含指纹、日期、文件路径）
+    归档入口：
+    1. 计算 SimHash + Parent_ID + instruction_hash
+    2. 写入 SQLite（含链表指针）
+    3. 追加原始文本到 Markdown
+    4. 更新 session_anchor（防迷失锚点）
     """
-    # 计算指纹
     sim = compute_simhash(dialogue_text)
     key = hamming_key(sim)
+    parent_id = get_last_simhash(session_id)
+    instr_hash = compute_instruction_hash(instruction_text)
     today = datetime.now().strftime("%Y-%m-%d")
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 原始文件路径
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""CREATE TABLE IF NOT EXISTS memory_index (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        simhash INTEGER NOT NULL,
+        parent_id INTEGER,
+        instruction_hash INTEGER NOT NULL,
+        hamming_key TEXT NOT NULL,
+        date TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        source_file TEXT NOT NULL,
+        summary TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS session_anchor (
+        session_id TEXT PRIMARY KEY,
+        instruction_text TEXT NOT NULL,
+        instruction_hash INTEGER NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""")
+
     source_file = str(RAW_DIR / f"{today}.md")
 
-    # 写入 SQLite
-    conn = init_db()
     conn.execute(
-        """
-        INSERT INTO memory_index (simhash, hamming_key, date, source_file, summary)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (sim, key, today, source_file, summary[:140] if summary else "")
+        """INSERT INTO memory_index
+           (simhash, parent_id, instruction_hash, hamming_key, date, session_id, source_file, summary)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (sim, parent_id, instr_hash, key, today, session_id, source_file, summary)
+    )
+    conn.execute(
+        """INSERT OR REPLACE INTO session_anchor (session_id, instruction_text, instruction_hash)
+           VALUES (?, ?, ?)""",
+        (session_id, instruction_text, instr_hash)
     )
     conn.commit()
     conn.close()
 
-    # 追加原文到 Markdown 分片
-    entry = f"""
----
-## [{timestamp}]
-{summary or '(无摘要)'}
-
-{dialogue_text}
-"""
     with open(source_file, "a", encoding="utf-8") as f:
-        f.write(entry)
+        f.write(f"\n---\n## Session {session_id} | {today}\n{dialogue_text}\n")
 
-    return {
-        "simhash": sim,
-        "hamming_key": key,
-        "date": today,
-        "source_file": source_file,
-        "status": "归档成功"
-    }
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("用法: python3 archive.py <对话内容> [摘要]")
-        sys.exit(1)
-
-    dialogue = sys.argv[1]
-    summary = sys.argv[2] if len(sys.argv) > 2 else ""
-
-    result = archive_dialogue(dialogue, summary)
-
-    # 输出状态（供外部调用捕获）
-    print(f"[claw-memory] 归档完成 | 指纹: {result['simhash']} | 日期: {result['date']} | 存储: 极小")
-    print(f"[claw-memory] 索引记录数: {sqlite3.connect(str(DB_PATH)).execute('SELECT COUNT(*) FROM memory_index').fetchone()[0]}")
-
+    print(f"归档完成 | 指纹: {sim} | Parent: {parent_id} | 会话: {session_id}")
 
 if __name__ == "__main__":
-    main()
+    argv = sys.argv[1:]
+    dialogue = argv[0]
+    instruction = argv[1] if len(argv) > 1 else ""
+    session_id = argv[2] if len(argv) > 2 else "default"
+    summary = argv[3] if len(argv) > 3 else ""
+    archive_dialogue(dialogue, instruction, session_id, summary)

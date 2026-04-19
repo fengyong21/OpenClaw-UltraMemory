@@ -1,135 +1,141 @@
 #!/usr/bin/env python3
-"""
-inject.py — 召回脚本：从历史中检索相关记忆并注入 Context
-
-功能：
-1. 计算用户问题的 SimHash 指纹
-2. 在 simhash.db 中按 Hamming 距离检索（阈值 <= 3）
-3. 按路径读取原文，取 top 3 条
-4. 输出格式化的召回结果（供注入 Context）
-
-使用方式：
-    python3 inject.py "用户问题"
-
-示例：
-    python3 inject.py "OpenClaw 记忆优化"
-    # 输出：
-    # [相关历史 1]
-    # 这是一个关于 OpenClaw 记忆优化的讨论
-"""
-
+"""从历史中召回相关记忆（V2：沿 Parent_ID 链路回溯组装上下文）"""
 import sys
 import sqlite3
 from pathlib import Path
-from typing import List, Dict
-
 from simhash_core import (
     compute_simhash,
     hamming_distance,
     hamming_key,
-    adjacent_keys_of,
-    is_similar
+    adjacent_keys_of
 )
 
-# ========== 配置 ==========
 MEMORY_DIR = Path.home() / ".workbuddy" / "memory"
 DB_PATH = MEMORY_DIR / "simhash.db"
 
 
-def recall(query: str, top_k: int = 3, threshold: int = 3) -> List[Dict]:
+def trace_chain(simhash: int, max_depth: int = 5) -> list:
+    """沿 Parent_ID 链表回溯最多 max_depth 轮"""
+    chain = []
+    current_hash = simhash
+    conn = sqlite3.connect(str(DB_PATH))
+
+    for _ in range(max_depth):
+        row = conn.execute(
+            "SELECT id, simhash, parent_id, source_file, summary, instruction_hash "
+            "FROM memory_index WHERE simhash=?",
+            (current_hash,)
+        ).fetchone()
+        if not row:
+            break
+        chain.append({
+            "simhash": row[1],
+            "parent_id": row[2],
+            "source_file": row[3],
+            "summary": row[4],
+            "instruction_hash": row[5],
+        })
+        if row[2] is None:
+            break
+        current_hash = row[2]
+
+    conn.close()
+    return chain
+
+
+def read_raw_text(source_file: str, max_chars: int = 800) -> str:
+    try:
+        with open(source_file, encoding="utf-8") as f:
+            return f.read()[:max_chars]
+    except FileNotFoundError:
+        return ""
+
+
+def recall(query: str, session_id: str = "", top_k: int = 3,
+           threshold: int = 3, max_depth: int = 5) -> list:
     """
-    根据问题检索相关的历史记忆。
-
-    检索策略：
-    1. 先按 hamming_key 缩小搜索范围
-    2. 在候选集中精确计算 Hamming 距离
-    3. 无结果时扩大搜索到相邻 key
-
-    Args:
-        query: 用户问题
-        top_k: 返回最多 N 条，默认为 3
-        threshold: Hamming 距离阈值，默认为 3
-
-    Returns:
-        List[Dict]: 相关历史列表，每条含 summary、raw、distance
+    召回主函数：
+    1. 计算问题 SimHash，按 Hamming 距离匹配
+    2. 命中后沿 Parent_ID 链路回溯 max_depth 轮
+    3. 顺路检查 instruction_hash 与当前会话锚点是否一致
+    4. 组装上下文返回
     """
     query_hash = compute_simhash(query)
-    query_key = hamming_key(query_hash)
+    key = hamming_key(query_hash)
+
+    conn = sqlite3.connect(str(DB_PATH))
+
+    current_anchor = conn.execute(
+        "SELECT instruction_hash FROM session_anchor WHERE session_id=?",
+        (session_id,)
+    ).fetchone()
+    current_anchor_hash = current_anchor[0] if current_anchor else None
 
     results = []
 
-    # 优先在同 key 内检索
-    candidates = _fetch_by_key(query_key)
+    candidates = conn.execute(
+        "SELECT simhash, source_file, summary, instruction_hash "
+        "FROM memory_index WHERE hamming_key=? ORDER BY created_at DESC LIMIT 50",
+        (key,)
+    ).fetchall()
 
-    # 无结果时扩大搜索
-    if not candidates:
-        for adj_key in adjacent_keys_of(query_key):
-            candidates = _fetch_by_key(adj_key)
-            if candidates:
+    for row in candidates:
+        simhash, source_file, summary, instr_hash = row
+        dist = hamming_distance(query_hash, simhash)
+        if dist <= threshold:
+            chain = trace_chain(simhash, max_depth)
+            anchor_match = any(
+                hamming_distance(c['instruction_hash'], current_anchor_hash) < 2
+                for c in chain if current_anchor_hash
+            )
+            raw_text = read_raw_text(source_file)
+            results.append({
+                "distance": dist,
+                "chain_depth": len(chain),
+                "anchor_match": anchor_match,
+                "summary": summary or raw_text[:200],
+                "chain": chain,
+                "raw_text": raw_text,
+            })
+            if len(results) >= top_k:
                 break
 
-    # 精确 Hamming 过滤 + 排序
-    scored = []
-    for row in candidates:
-        simhash, source_file, summary = row[1], row[4], row[5]
-        dist = hamming_distance(query_hash, simhash)
-        if dist <= threshold + 2:  # 扩大阈值兜底
-            try:
-                with open(source_file, encoding="utf-8") as f:
-                    raw = f.read()
-                scored.append({
-                    "distance": dist,
-                    "source_file": source_file,
-                    "summary": summary or "",
-                    "raw": raw
-                })
-            except FileNotFoundError:
-                continue
+    conn.close()
 
-    scored.sort(key=lambda x: x["distance"])
-    return scored[:top_k]
+    if not results:
+        for adj in adjacent_keys_of(key):
+            conn = sqlite3.connect(str(DB_PATH))
+            candidates = conn.execute(
+                "SELECT simhash, source_file, summary, instruction_hash "
+                "FROM memory_index WHERE hamming_key=? ORDER BY created_at DESC LIMIT 20",
+                (adj,)
+            ).fetchall()
+            for row in candidates:
+                simhash, source_file, summary, instr_hash = row
+                dist = hamming_distance(query_hash, simhash)
+                if dist <= threshold + 2:
+                    chain = trace_chain(simhash, max_depth)
+                    raw_text = read_raw_text(source_file)
+                    results.append({
+                        "distance": dist,
+                        "chain_depth": len(chain),
+                        "anchor_match": False,
+                        "summary": summary or raw_text[:200],
+                        "chain": chain,
+                        "raw_text": raw_text,
+                    })
+                    if len(results) >= top_k:
+                        break
+            conn.close()
+            if len(results) >= top_k:
+                break
 
-
-def _fetch_by_key(key: str) -> List:
-    """从 SQLite 按 hamming_key 拉取候选记录"""
-    try:
-        conn = sqlite3.connect(str(DB_PATH))
-        rows = conn.execute(
-            "SELECT * FROM memory_index WHERE hamming_key=? ORDER BY created_at DESC",
-            (key,)
-        ).fetchall()
-        conn.close()
-        return rows
-    except Exception:
-        return []
-
-
-def format_recall_output(recalls: List[Dict]) -> str:
-    """将召回结果格式化为可注入 Context 的文本"""
-    if not recalls:
-        return ""
-
-    output = []
-    for i, r in enumerate(recalls, 1):
-        content = r["summary"] or r["raw"][:200]
-        output.append(f"[相关历史 {i}]（Hamming 距离: {r['distance']}）\n{content}\n")
-
-    return "\n".join(output)
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("用法: python3 inject.py <用户问题>")
-        sys.exit(1)
-
-    query = sys.argv[1]
-    recalls = recall(query)
-
-    if recalls:
-        print(format_recall_output(recalls))
-    else:
-        print(f"[claw-memory] 未找到与「{query}」相关的记忆")
-
+    return sorted(results, key=lambda x: (not x['anchor_match'], x['distance']))
 
 if __name__ == "__main__":
-    main()
+    session_id = sys.argv[2] if len(sys.argv) > 2 else ""
+    recalls = recall(sys.argv[1], session_id)
+    for i, r in enumerate(recalls, 1):
+        print(f"[相关历史 {i}]（链路深度: {r['chain_depth']}）")
+        print(r['summary'])
+        print()
