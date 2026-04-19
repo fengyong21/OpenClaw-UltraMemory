@@ -1,83 +1,68 @@
 ---
 name: claw-memory
-version: 3.0.0
-description: Claw 记忆优化 V3。热度钉扎滑动窗，极简算力，越用越聪明。触发：对话超过 15 轮、"回忆"、"之前"、"还记得"
+description: OpenClaw-UltraMemory 记忆系统。触发词：记忆、回忆、归档、历史记录、自动技能、子任务并行。V4 融合 Hermes 自动技能生长机制。
 triggers:
+  - "记忆"
   - "回忆"
-  - "之前我们"
-  - "历史上"
-  - "还记得"
-  - "查一下"
-  - 对话轮次 >= 15
-  - 上下文利用率 >= 70%
-  - 检测到 Agent 跑偏
+  - "之前"
+  - "历史"
+  - "归档"
+  - "自动生成技能"
+  - "子任务并行"
+  - "子Agent"
+  - "多步骤任务"
 ---
 
-# Claw Memory Skill V3
+# Claw Memory V4
 
-## 设计哲学
+OpenClaw 极限记忆插件，V4 版本融合 Hermes Agent 自动技能生长机制。
 
-> 新数据进，旧数据出，好数据留，越用越聪明。
+## 核心能力
 
-摒弃 V2 的 SimHash 复杂算法，用一张极简单表 + 热度机制搞定全部逻辑。
+1. **热度钉扎滑动窗**：1000 条上限，7 天保护期，自然衰减
+2. **自动技能生成**：同类问题解决 3 次 → 自动写 SKILL.md
+3. **子智能体并行**：多步骤任务自动拆分并发执行
+4. **防迷失锚点**：instruction_hash 检测偏离自动拉回
 
-## 版本对比
+## 脚本说明
 
-| 特性 | V1 | V2 (SimHash) | V3 (HotWindow) |
-|------|----|-------------|----------------|
-| 存储结构 | 5列 | 8列+2索引 | **4列单表** |
-| 检索算法 | TOP-K | Hamming距离 | **关键词+热度** |
-| 越用越聪明 | ❌ | ❌ | **✅ Heat强化** |
-| 自然衰减 | ❌ | ❌ | **✅ ×0.99** |
-| 防迷失锚点 | ❌ | ✅ | **✅ 继承** |
-| 核心代码量 | 150行 | 400行 | **<100行** |
-
-## SQLite 单表结构
-
-```sql
-CREATE TABLE memory (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw_link  TEXT    NOT NULL,   -- MD文件路径（无损原文）
-    heat      REAL    DEFAULT 1,  -- 热度（浮点，支持衰减）
-    timestamp INTEGER NOT NULL,   -- Unix时间戳
-    summary   TEXT                -- 一句话摘要
-);
-```
-
-## 运行逻辑
-
-### Phase 1: 写入（滑动+衰减）
-1. 原文追加到 `raw/YYYY-MM-DD.md`（无损只追加，永不修改）
-2. 现有所有记录热度 × 0.99（自然衰减，防老霸主）
-3. 插入新记录（heat=1，保护期30分钟内不参与淘汰）
-4. 若总数 > 1000：删除热度最低且已过保护期的记录
-
-### Phase 2: 检索（双层过滤）
-1. 关键词初筛：提取问题中的中英文关键词，匹配 summary
-2. 热度排序：取 TOP-10
-3. 无关键词命中时，降级为纯热度 TOP-10
-
-### Phase 3: 强化（越用越聪明）
-- 记忆被成功使用时调用 `reinforce(id)`
-- Heat +1，上限 200（防垄断）
-
-### Phase 4: 防迷失（继承 V2）
-- 会话开始时调用 `set_anchor(session_id, instruction)`
-- 每次响应前调用 `check_drift()`
-- 偏离距离 > 8 时，将原始目标注入 Context
-
-## 核心文件
-
-```
-scripts/hot_window.py    # 全部逻辑，<100行
-```
+| 脚本 | 作用 |
+|------|------|
+| `hot_window.py` | 核心：写入/检索/强化/衰减 |
+| `auto_skill.py` | 自动：从成功经验中生成新技能 |
+| `child_agent.py` | 并行：多步骤任务拆分执行 |
+| `migrate.py` | 迁移：历史数据批量灌入 |
 
 ## CLI 用法
 
 ```bash
-python hot_window.py write "对话内容"           # 归档
-python hot_window.py search "查询关键词"         # 检索
-python hot_window.py reinforce 42               # 强化 id=42
-python hot_window.py anchor sess1 "原始目标"    # 设锚点
-python hot_window.py drift "当前内容" sess1     # 检测跑偏
+# 记忆写入
+python3 scripts/hot_window.py write "这是一段重要对话"
+
+# 记忆检索
+python3 scripts/hot_window.py search "之前关于什么的讨论"
+
+# 强化（被命中后调用）
+python3 scripts/hot_window.py reinforce 1
+
+# 设置锚点
+python3 scripts/hot_window.py anchor "session-001" "原始任务"
+
+# 检测跑偏
+python3 scripts/hot_window.py drift "当前内容" "session-001"
+
+# 查看自动技能
+python3 scripts/auto_skill.py list
+
+# 任务规划（子Agent）
+python3 scripts/child_agent.py plan "帮我部署 GEO 项目"
+
+# 并行执行
+python3 scripts/child_agent.py run "帮我部署 GEO 项目"
 ```
+
+## 协同
+
+- `capability-evolver`：大方向基因优化（1-2 周/次）
+- `auto_skill.py`：技能层面小颗粒生长（每次成功触发）
+- `child_agent.py`：并行执行，减少上下文消耗
