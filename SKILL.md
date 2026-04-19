@@ -1,57 +1,83 @@
 ---
 name: claw-memory
-version: 2.0.0
-description: Claw 记忆优化 V2。触发：对话超过 15 轮、上下文利用率超 70%、"回忆"、"之前"、"历史上"
+version: 3.0.0
+description: Claw 记忆优化 V3。热度钉扎滑动窗，极简算力，越用越聪明。触发：对话超过 15 轮、"回忆"、"之前"、"还记得"
 triggers:
   - "回忆"
   - "之前我们"
   - "历史上"
-  - "查一下"
   - "还记得"
+  - "查一下"
   - 对话轮次 >= 15
   - 上下文利用率 >= 70%
-  - 检测到跑偏
+  - 检测到 Agent 跑偏
 ---
 
-# Claw Memory Skill V2
+# Claw Memory Skill V3
 
-## 核心升级
+## 设计哲学
 
-V2 相比 V1 新增三大特性：
-1. **Parent_ID 链表**：检索时沿链路回溯，逻辑连贯不断裂
-2. **instruction_hash 锚点**：防 Agent 跑偏，永远记得原始目标
-3. **drift_detect.py**：每次响应前自动检测是否偏离锚点
+> 新数据进，旧数据出，好数据留，越用越聪明。
 
-## 执行逻辑
+摒弃 V2 的 SimHash 复杂算法，用一张极简单表 + 热度机制搞定全部逻辑。
 
-### Phase 1: 热数据保持
-- 读取 MEMORY.md（灵魂记忆）注入 Context
-- 检查 session_anchor，获取原始指令哈希锚点
-- 不主动压缩当前任务相关上下文
+## 版本对比
 
-### Phase 2: 温数据归档（满足触发条件时执行）
-1. 调用 `scripts/archive.py`：
-   - 计算 SimHash + 查询上一轮 parent_id
-   - 记录 instruction_hash（防迷失锚点）
-   - 写入 `simhash.db`（含链表指针）
-   - 追加原文到 `raw/YYYY-MM-DD.md`
-2. 后台静默执行，不弹窗，不打断
+| 特性 | V1 | V2 (SimHash) | V3 (HotWindow) |
+|------|----|-------------|----------------|
+| 存储结构 | 5列 | 8列+2索引 | **4列单表** |
+| 检索算法 | TOP-K | Hamming距离 | **关键词+热度** |
+| 越用越聪明 | ❌ | ❌ | **✅ Heat强化** |
+| 自然衰减 | ❌ | ❌ | **✅ ×0.99** |
+| 防迷失锚点 | ❌ | ✅ | **✅ 继承** |
+| 核心代码量 | 150行 | 400行 | **<100行** |
 
-### Phase 3: 记忆召回（满足召回触发时执行）
-1. 用户提问中含召回关键词，或上下文利用率高
-2. 调用 `scripts/inject.py`：
-   - 计算问题 SimHash
-   - Hamming 距离匹配 + Parent_ID 链路回溯最多 5 轮
-   - 顺路检查 instruction_hash 与当前锚点是否一致
-   - 组装上下文注入 Context
+## SQLite 单表结构
 
-### Phase 4: 防迷失检测（每次响应前执行）
-1. 调用 `scripts/drift_detect.py`：
-   - 比对当前 Context 指令与 session_anchor
-   - 若 hamming_distance > 8，判定为跑偏
-2. 触发拉回：将锚点摘要注入 Context
+```sql
+CREATE TABLE memory (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_link  TEXT    NOT NULL,   -- MD文件路径（无损原文）
+    heat      REAL    DEFAULT 1,  -- 热度（浮点，支持衰减）
+    timestamp INTEGER NOT NULL,   -- Unix时间戳
+    summary   TEXT                -- 一句话摘要
+);
+```
 
-## 存储约束
-- SQLite 只存指纹 + 元数据 + 链表指针，不存全文
-- 原文按 YYYY-MM-DD 分片存 Markdown
-- 历史数据禁止删除、覆盖
+## 运行逻辑
+
+### Phase 1: 写入（滑动+衰减）
+1. 原文追加到 `raw/YYYY-MM-DD.md`（无损只追加，永不修改）
+2. 现有所有记录热度 × 0.99（自然衰减，防老霸主）
+3. 插入新记录（heat=1，保护期30分钟内不参与淘汰）
+4. 若总数 > 1000：删除热度最低且已过保护期的记录
+
+### Phase 2: 检索（双层过滤）
+1. 关键词初筛：提取问题中的中英文关键词，匹配 summary
+2. 热度排序：取 TOP-10
+3. 无关键词命中时，降级为纯热度 TOP-10
+
+### Phase 3: 强化（越用越聪明）
+- 记忆被成功使用时调用 `reinforce(id)`
+- Heat +1，上限 200（防垄断）
+
+### Phase 4: 防迷失（继承 V2）
+- 会话开始时调用 `set_anchor(session_id, instruction)`
+- 每次响应前调用 `check_drift()`
+- 偏离距离 > 8 时，将原始目标注入 Context
+
+## 核心文件
+
+```
+scripts/hot_window.py    # 全部逻辑，<100行
+```
+
+## CLI 用法
+
+```bash
+python hot_window.py write "对话内容"           # 归档
+python hot_window.py search "查询关键词"         # 检索
+python hot_window.py reinforce 42               # 强化 id=42
+python hot_window.py anchor sess1 "原始目标"    # 设锚点
+python hot_window.py drift "当前内容" sess1     # 检测跑偏
+```

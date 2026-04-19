@@ -1,52 +1,59 @@
-#!/bin/bash
-# install.sh — 一键安装脚本
-# 用法: ./install.sh
-
+#!/usr/bin/env bash
+# Claw Memory V3 - 一键安装脚本
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILL_NAME="claw-memory"
-TARGET_DIR="$HOME/.workbuddy/skills/$SKILL_NAME"
+SKILL_DIR="$HOME/.workbuddy/skills/claw-memory"
 MEMORY_DIR="$HOME/.workbuddy/memory"
+RAW_DIR="$MEMORY_DIR/raw"
+DB_PATH="$MEMORY_DIR/hot_window.db"
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "🦞 OpenClaw-UltraMemory 安装脚本"
-echo "================================"
+echo "🦞 Claw Memory V3 安装中..."
 
-# 1. 复制 skill 到 ~/.workbuddy/skills/
-echo "[1/4] 复制 skill 到 $TARGET_DIR ..."
-mkdir -p "$HOME/.workbuddy/skills"
-cp -r "$SCRIPT_DIR" "$TARGET_DIR"
-echo "    ✓ 已安装到 $TARGET_DIR"
+# 1. 创建目录
+mkdir -p "$SKILL_DIR/scripts"
+mkdir -p "$RAW_DIR"
 
-# 2. 创建 memory 目录
-echo "[2/4] 初始化 memory 目录..."
-mkdir -p "$MEMORY_DIR/raw"
-mkdir -p "$MEMORY_DIR/session"
-echo "    ✓ memory 目录结构已创建"
+# 2. 复制文件
+cp "$SRC_DIR/SKILL.md" "$SKILL_DIR/SKILL.md"
+cp "$SRC_DIR/scripts/hot_window.py" "$SKILL_DIR/scripts/hot_window.py"
 
-# 3. 运行迁移（一次性，建立现有 .md 的索引）
-echo "[3/4] 迁移已有记忆文件到 simhash.db..."
-cd "$TARGET_DIR/scripts"
-if command -v python3 &> /dev/null; then
-    python3 migrate.py
-else
-    echo "    ⚠ python3 未找到，跳过迁移（稍后可手动运行 python3 scripts/migrate.py）"
-fi
-
-# 4. 验证
-echo "[4/4] 验证安装..."
-if [ -f "$TARGET_DIR/SKILL.md" ] && [ -f "$TARGET_DIR/scripts/simhash_core.py" ]; then
-    echo "    ✓ 安装验证通过"
-else
-    echo "    ✗ 安装验证失败，请检查文件完整性"
+# 3. 检查 Python3
+if ! command -v python3 &>/dev/null; then
+    echo "❌ 需要 Python3，请先安装"
     exit 1
 fi
 
+# 4. 初始化数据库
+python3 - <<EOF
+import sqlite3, os
+db = sqlite3.connect("$DB_PATH")
+db.execute("""CREATE TABLE IF NOT EXISTS memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_link TEXT NOT NULL,
+    heat REAL NOT NULL DEFAULT 1,
+    timestamp INTEGER NOT NULL,
+    summary TEXT
+)""")
+db.execute("CREATE INDEX IF NOT EXISTS idx_heat ON memory(heat DESC)")
+db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON memory(timestamp)")
+db.execute("""CREATE TABLE IF NOT EXISTS session_anchor (
+    session_id TEXT PRIMARY KEY,
+    instruction_text TEXT NOT NULL,
+    instruction_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)""")
+db.commit()
+db.close()
+print("✅ 数据库初始化完成")
+EOF
+
 echo ""
-echo "🎉 安装完成！"
+echo "✅ 安装完成！"
+echo "   Skill 位置：$SKILL_DIR"
+echo "   数据库位置：$DB_PATH"
+echo "   原文归档：  $RAW_DIR"
 echo ""
-echo "下一步："
-echo "  1. 重启 WorkBuddy 使 skill 生效"
-echo "  2. 查看文档: cat $TARGET_DIR/README.md"
-echo "  3. 测试归档: python3 $TARGET_DIR/scripts/archive.py \"你好世界\""
-echo "  4. 测试召回: python3 $TARGET_DIR/scripts/inject.py \"你好\""
+echo "验证安装："
+echo "  python3 $SKILL_DIR/scripts/hot_window.py write '测试记忆'"
+echo "  python3 $SKILL_DIR/scripts/hot_window.py search '测试'"
