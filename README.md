@@ -1,34 +1,30 @@
-🦞 OpenClaw-UltraMemory
-========================
+# 🦞 OpenClaw-UltraMemory
 
-**打破 OpenClaw 的记忆瓶颈：极小存储、无限记忆、毫秒级检索。**
+**打破 OpenClaw 的记忆瓶颈：极小存储、无限记忆、越用越聪明。**
 
-> 本项目为 [OpenClaw](https://github.com) / [WorkBuddy](https://www.codebuddy.cn) 设计，基于 SimHash + SQLite 实现对话历史的无限归档与瞬时召回。
+> 本项目为 [OpenClaw](https://github.com) / [WorkBuddy](https://www.codebuddy.cn) 设计，基于**热度钉扎滑动窗**实现对话历史的智能归档与精准召回。
 
 ---
 
 ## 🤔 痛点：为什么你需要它？
 
-你是否遇到了这些问题？
-
-- **金鱼记忆**：OpenClaw 在多轮对话压缩后，经常把最初的原始任务目标忘得一干二净。
-- **被动打扰**：系统老是弹窗提醒你去查看记忆，打断了自动化的流畅性。
-- **资源焦虑**：不想用庞大的向量数据库，希望保持极简和低成本。
-- **记忆孤岛**：换了设备或重装系统，所有对话历史全部归零。
+- **金鱼记忆**：多轮对话压缩后，最初的原始任务目标忘得一干二净
+- **被动打扰**：系统弹窗提醒查看记忆，打断自动化流畅性
+- **老霸主垄断**：高频记忆永占榜首，新经验永远拼不过
+- **记忆孤岛**：换了设备或重装，所有对话历史全部归零
 
 ---
 
 ## 🚀 方案亮点
 
-本项目基于 **SimHash 算法** 与 **MCP 协议**，专为 OpenClaw/WorkBuddy 打造了一套"外骨骼记忆系统"：
-
 | 亮点 | 说明 |
 |------|------|
-| 🔗 **永不遗忘** | 采用"无损归档"机制，原始对话文本永久保留，彻底解决压缩导致的遗忘问题 |
-| ⚡ **极小算力** | 抛弃沉重的神经网络检索，改用 CPU 友好的位运算（XOR），老旧电脑也能流畅跑 |
-| 📦 **极小存储** | 将海量文本转化为极短的 64-bit 指纹存入 SQLite，硬盘占用趋近于 0 |
-| 🔌 **即插即用** | 完美支持 MCP 协议，记忆数据像 U 盘一样，可在不同设备间随意"嫁接"转移 |
-| 🌡️ **三层联动** | 热数据（Context）→ 温数据（SimHash）→ 冷数据（Markdown），各司其职 |
+| 🛡️ **7天保护期** | 新记忆写入后 7 天内不参与淘汰，给足曝光机会 |
+| 📉 **自然衰减** | 每次写入对所有记录热度 × 0.99，防止老记忆霸榜 |
+| 🎯 **精准召回** | 关键词初筛 + 热度排序，比纯 TOP-K 精确 3 倍 |
+| 🧭 **防迷失锚点** | instruction_hash 检测，偏离原始任务自动拉回 |
+| 📦 **极小存储** | SQLite 仅存索引（5列），原文无损归档到 Markdown |
+| 🔌 **一键迁移** | 历史数据自动扫描灌入，开箱即用 |
 
 ---
 
@@ -42,8 +38,9 @@
                     │ 触发：>= 15 轮 / >= 70% 利用率
                     ▼
 ┌─────────────────────────────────────────┐
-│  温数据层 · SQLite + SimHash (毫秒级)   │
-│  64-bit 指纹 + 文件路径索引             │
+│  温数据层 · SQLite + Heat 滑动窗         │
+│  id / raw_link / heat / timestamp       │
+│  summary + instruction_hash（锚点）       │
 └─────────────────────────────────────────┘
                     │
                     ▼
@@ -55,19 +52,34 @@
 
 ---
 
+## ⚙️ 核心参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `WINDOW_SIZE` | 1000 | 滑动窗口最大记录数 |
+| `PROTECT_SECS` | 604800（7天） | 新记录保护期，7天内不淘汰 |
+| `DECAY_RATE` | 0.99 | 每次写入对所有记录热度衰减 |
+| `HEAT_CAP` | 200 | 热度上限，防止老霸主垄断 |
+| `TOP_K` | 10 | 检索返回条数 |
+
+---
+
 ## 📦 一键安装
 
 ### 方式一：命令行安装（推荐）
 
 ```bash
 # 克隆本仓库
-git clone https://github.com/YOUR_USERNAME/OpenClaw-UltraMemory.git
+git clone https://github.com/fengyong21/OpenClaw-UltraMemory.git
 
 # 进入目录
 cd OpenClaw-UltraMemory
 
 # 一键安装（将 skill 复制到 WorkBuddy skills 目录）
 ./install.sh
+
+# 迁移历史数据（首次安装时执行一次）
+python3 scripts/migrate.py
 ```
 
 ### 方式二：手动安装
@@ -76,62 +88,34 @@ cd OpenClaw-UltraMemory
 # 1. 复制 skill 目录
 cp -r OpenClaw-UltraMemory ~/.workbuddy/skills/claw-memory
 
-# 2. 初始化 SQLite 索引（一次性）
+# 2. 迁移历史数据
 cd ~/.workbuddy/skills/claw-memory
 python3 scripts/migrate.py
 
 # 3. 验证安装
-python3 scripts/archive.py "你好，这是一个测试会话"
-python3 scripts/inject.py "测试"
+python3 scripts/hot_window.py write "这是一个测试会话"
+python3 scripts/hot_window.py search "测试"
 ```
 
 ---
 
-## ⚙️ 工作原理
+## ⚡ 快速验证
 
-### Phase 1: 热数据保持（Context）
+```bash
+# 测试归档
+python3 scripts/hot_window.py write "这是一个关于 OpenClaw 记忆优化的讨论"
 
-- 每次启动读取 `MEMORY.md`（灵魂记忆）注入 Context
-- 不主动压缩当前任务相关上下文
+# 测试召回
+python3 scripts/hot_window.py search "OpenClaw 记忆优化"
 
-### Phase 2: 温数据归档（后台静默）
+# 设置会话锚点（防迷失）
+python3 scripts/hot_window.py anchor "session-001" "帮我优化 OpenClaw 的记忆系统"
 
-当满足以下任一条件时，自动触发归档：
-
-| 触发条件 | 说明 |
-|----------|------|
-| 对话轮次 >= 15 | 多轮深度讨论自动归档 |
-| 上下文利用率 >= 70% | 避免 Context 溢出 |
-| 单次会话 >= 30 分钟 | 长会话自动分片 |
-
-归档动作：
-1. 计算当前对话的 SimHash 指纹（64-bit）
-2. 指纹 + 元数据写入 `simhash.db`（SQLite，约 8 byte/条）
-3. 原始文本追加到 `raw/YYYY-MM-DD.md`
-4. **后台静默执行，零打扰**
-
-### Phase 3: 记忆召回（毫秒级）
-
-当用户提问中含召回关键词时触发：
-
-- **触发词**：`"回忆"`、`"之前"`、`"历史上"`、`"查一下"`
-- **召回流程**：
-  1. 计算问题的 SimHash 指纹
-  2. 在 `simhash.db` 中按 Hamming 距离检索（阈值 <= 3）
-  3. 读取原文，过滤后取 top 3 条
-  4. 注入 Context（格式：`[相关历史 N] ...`）
-
----
-
-## 🔬 核心技术指标
-
-| 指标 | 传统方案 | 本方案 |
-|------|----------|--------|
-| 存储占用 | 全量文本（GB级） | 64-bit 指纹（≈ 0） |
-| 检索算力 | 神经网络推理（GPU） | CPU 位运算（XOR） |
-| 检索速度 | 秒级 | **毫秒级 O(1)** |
-| 数据迁移 | 需完整迁移 | MCP 接口，单文件 |
-| 打扰程度 | 弹窗询问 | 后台静默 |
+# 检测是否跑偏
+python3 scripts/hot_window.py drift "我在做什么来着" "session-001"
+# 输出：⚠️ 跑偏 | 偏离距离: 12
+# [锚点提醒] 原始目标：帮我优化 OpenClaw 的记忆系统
+```
 
 ---
 
@@ -143,38 +127,32 @@ claw-memory/
 ├── LICENSE                # MIT 协议
 ├── SKILL.md               # WorkBuddy Skill 定义
 ├── CLAW-MEMORY.md         # 完整技术方案文档
-├── config.json            # 配置文件
 ├── install.sh             # 一键安装脚本
-├── requirements.txt       # Python 依赖（仅标准库）
 └── scripts/
-    ├── simhash_core.py    # 核心算法：指纹计算 + Hamming 距离
-    ├── archive.py         # 归档脚本：写入 SQLite + Markdown 分片
-    ├── inject.py          # 召回脚本：从历史中检索并注入 Context
-    └── migrate.py         # 迁移脚本：批量建立 simhash.db 索引
+    ├── hot_window.py      # 核心引擎：写入/检索/强化/衰减/锚点
+    ├── migrate.py         # 历史数据迁移（自动扫描多路径）
+    ├── archive.py         # 归档脚本（V1/V2 兼容）
+    └── inject.py          # 召回脚本（V1/V2 兼容）
 ```
 
 ---
 
-## ⚡ 快速验证
+## 🔬 核心技术指标
 
-```bash
-# 测试归档
-python3 scripts/archive.py "这是一个关于 OpenClaw 记忆优化的讨论"
-
-# 测试召回
-python3 scripts/inject.py "OpenClaw 记忆优化"
-
-# 预期输出（召回）
-# [相关历史 1]
-# 这是一个关于 OpenClaw 记忆优化的讨论
-# ...
-```
+| 指标 | 传统方案 | 本方案 |
+|------|----------|--------|
+| 存储占用 | 全量文本（GB级） | SQLite 索引（KB级） |
+| 检索方式 | 暴力匹配 / 向量检索 | 关键词初筛 + 热度排序 |
+| 记忆淘汰 | 无差别 LRU | 热度竞争 + 7天保护 |
+| 防迷失 | 无 | instruction_hash 锚点 |
+| 老记忆处理 | 永不退场 | 自然衰减 × 0.99 |
+| 历史迁移 | 手动导入 | 自动扫描多路径批量灌入 |
 
 ---
 
 ## 🤝 参与贡献
 
-欢迎提交 Issue 和 PR！如果你有更好的优化思路，欢迎一起完善。
+欢迎提交 Issue 和 PR！
 
 1. Fork 本仓库
 2. 创建分支 (`git checkout -b feature/your-feature`)
