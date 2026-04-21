@@ -1,25 +1,24 @@
 {
   "name": "claw-memory",
-  "version": "1.0.0",
-  "description": "Claw 极限记忆优化方案 - SimHash + SQLite",
+  "version": "4.0.0",
+  "description": "OpenClaw-UltraMemory V4 - 热度钉扎滑动窗 + 父子链上下文",
   "memory_dir": "~/.workbuddy/memory",
-  "db_path": "~/.workbuddy/memory/simhash.db",
+  "db_path": "~/.workbuddy/memory/hot_window.db",
   "raw_dir": "~/.workbuddy/memory/raw",
-  "archive": {
-    "triggers": {
-      "max_turns": 15,
-      "context_threshold": 0.7,
-      "session_timeout_minutes": 30
-    },
-    "simhash_width": 64,
-    "hamming_key_bits": 16
+  "window": {
+    "size": 1000,
+    "protect_secs": 604800,
+    "decay_rate": 0.99,
+    "heat_cap": 200,
+    "heat_floor": 1
   },
-  "recall": {
-    "top_k": 3,
-    "hamming_threshold": 3,
-    "expand_threshold": 5
+  "search": {
+    "top_k": 10,
+    "keywords_max": 5
   },
-  "keywords": {
-    "recall": ["回忆", "之前", "历史上", "查一下", "之前我们"]
+  "auto_skill": {
+    "reinforce_threshold": 3,
+    "min_content_length": 200,
+    "similarity_threshold": 0.8
   }
 }

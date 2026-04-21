@@ -1,68 +1,44 @@
 ---
 name: claw-memory
-description: OpenClaw-UltraMemory 记忆系统。触发词：记忆、回忆、归档、历史记录、自动技能、子任务并行。V4 融合 Hermes 自动技能生长机制。
-triggers:
-  - "记忆"
-  - "回忆"
-  - "之前"
-  - "历史"
-  - "归档"
-  - "自动生成技能"
-  - "子任务并行"
-  - "子Agent"
-  - "多步骤任务"
+description: OpenClaw 极限记忆系统。触发词：记忆、之前、回忆、上下文、历史记录、链路回溯、父子链、热度。自动执行写入和检索，无需用户手动触发。
 ---
 
-# Claw Memory V4
+# Claw-Memory Skill
 
-OpenClaw 极限记忆插件，V4 版本融合 Hermes Agent 自动技能生长机制。
+## 核心功能
 
-## 核心能力
+当用户提到"记忆"、"之前"、"回忆"、"上下文"等关键词时，自动调用。
 
-1. **热度钉扎滑动窗**：1000 条上限，7 天保护期，自然衰减
-2. **自动技能生成**：同类问题解决 3 次 → 自动写 SKILL.md
-3. **子智能体并行**：多步骤任务自动拆分并发执行
-4. **防迷失锚点**：instruction_hash 检测偏离自动拉回
-
-## 脚本说明
-
-| 脚本 | 作用 |
-|------|------|
-| `hot_window.py` | 核心：写入/检索/强化/衰减 |
-| `auto_skill.py` | 自动：从成功经验中生成新技能 |
-| `child_agent.py` | 并行：多步骤任务拆分执行 |
-| `migrate.py` | 迁移：历史数据批量灌入 |
-
-## CLI 用法
+## 调用方式
 
 ```bash
-# 记忆写入
-python3 scripts/hot_window.py write "这是一段重要对话"
+cd /Users/mac/WorkBuddy/Claw/claw-memory
 
-# 记忆检索
-python3 scripts/hot_window.py search "之前关于什么的讨论"
+# 写入记忆
+python3 scripts/hot_window.py write "对话内容摘要"
 
-# 强化（被命中后调用）
-python3 scripts/hot_window.py reinforce 1
+# 检索记忆
+python3 scripts/hot_window.py search "关键词"
 
-# 设置锚点
-python3 scripts/hot_window.py anchor "session-001" "原始任务"
+# 链路回溯（给定记录 id）
+python3 scripts/hot_window.py chain <record_id> [depth]
 
-# 检测跑偏
-python3 scripts/hot_window.py drift "当前内容" "session-001"
+# 获取最热记忆的上下文链
+python3 scripts/hot_window.py context [depth]
 
-# 查看自动技能
-python3 scripts/auto_skill.py list
+# 强化记忆热度
+python3 scripts/hot_window.py reinforce <record_id>
 
-# 任务规划（子Agent）
-python3 scripts/child_agent.py plan "帮我部署 GEO 项目"
+# 会话锚点防迷失
+python3 scripts/hot_window.py anchor <session_id> "原始目标"
 
-# 并行执行
-python3 scripts/child_agent.py run "帮我部署 GEO 项目"
+# 检测是否跑偏
+python3 scripts/hot_window.py drift "当前内容" <session_id>
 ```
 
-## 协同
+## 架构
 
-- `capability-evolver`：大方向基因优化（1-2 周/次）
-- `auto_skill.py`：技能层面小颗粒生长（每次成功触发）
-- `child_agent.py`：并行执行，减少上下文消耗
+- **raw/**：原始数据，只追加不可篡改
+- **hot_window.db**：索引数据库（id, parent_id, raw_link, heat, timestamp, summary）
+- **parent_id**：父子链，解决数据膨胀后逻辑断裂
+- **heat**：热度，强化递增，衰减递减，淘汰最低

@@ -37,14 +37,15 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS memory (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            raw_link  TEXT    NOT NULL,          -- MD 文件路径
-            heat      REAL    NOT NULL DEFAULT 1, -- 热度（浮点，衰减用）
-            timestamp INTEGER NOT NULL,           -- Unix 时间戳
-            summary   TEXT                        -- 一句话摘要（可选）
+            parent_id INTEGER,                       -- 父节点 ID，形成父子链（None=根节点）
+            raw_link  TEXT    NOT NULL,              -- MD 文件路径
+            heat      REAL    NOT NULL DEFAULT 1,    -- 热度（浮点，衰减用）
+            timestamp INTEGER NOT NULL,               -- Unix 时间戳
+            summary   TEXT                          -- 一句话摘要
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_heat ON memory(heat DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts   ON memory(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_heat     ON memory(heat DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts      ON memory(timestamp)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS session_anchor (
@@ -54,6 +55,17 @@ def init_db(conn: sqlite3.Connection):
             created_at       INTEGER NOT NULL
         )
     """)
+    conn.commit()
+
+    # 迁移旧数据：如果 parent_id 列不存在，则 ALTER TABLE 添加
+    try:
+        conn.execute("SELECT parent_id FROM memory LIMIT 1")
+        # 列存在，索引可能也已存在，再次创建不会报错（IF NOT EXISTS）
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_parent ON memory(parent_id)")
+    except sqlite3.OperationalError:
+        # 旧表没有 parent_id 列，需要 ALTER TABLE + 索引
+        conn.execute("ALTER TABLE memory ADD COLUMN parent_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_parent ON memory(parent_id)")
     conn.commit()
 
 
@@ -87,11 +99,12 @@ def evict(conn: sqlite3.Connection):
 # ────────────────── 写入 ──────────────────
 def write_memory(text: str, summary: str = "") -> int:
     """
-    归档一段对话文本。
+    归档一段对话文本，构建父子链。
     1. 原文追加到 raw/YYYY-MM-DD.md（无损只追加）
-    2. 自然衰减现有记录
-    3. 插入新索引（heat=1）
-    4. 淘汰超出窗口的最旧/最冷记录
+    2. 查询最新一条记录的 id，作为新记录的 parent_id
+    3. 自然衰减现有记录
+    4. 插入新索引（heat=1，parent_id=上一条id）
+    5. 淘汰超出窗口的最旧/最冷记录
     """
     today = datetime.now().strftime("%Y-%m-%d")
     raw_path = RAW_DIR / f"{today}.md"
@@ -103,12 +116,15 @@ def write_memory(text: str, summary: str = "") -> int:
     conn = sqlite3.connect(str(DB_PATH))
     init_db(conn)
 
+    # 查最新一条记录的 id，作为父节点（没有记录时为 None=根节点）
+    last_id = conn.execute("SELECT MAX(id) FROM memory").fetchone()[0]
+
     apply_decay(conn)
 
     ts = int(time.time())
     cursor = conn.execute(
-        "INSERT INTO memory (raw_link, heat, timestamp, summary) VALUES (?, 1, ?, ?)",
-        (str(raw_path), ts, summary or text[:120])
+        "INSERT INTO memory (parent_id, raw_link, heat, timestamp, summary) VALUES (?, ?, 1, ?, ?)",
+        (last_id, str(raw_path), ts, summary or text[:120])
     )
     new_id = cursor.lastrowid
 
@@ -151,14 +167,14 @@ def search(query: str = "", top_k: int = TOP_K) -> list:
         like_clauses = " OR ".join(["summary LIKE ?" for _ in keywords])
         params = [f"%{kw}%" for kw in keywords]
         rows = conn.execute(
-            f"SELECT id, raw_link, heat, timestamp, summary FROM memory "
+            f"SELECT id, parent_id, raw_link, heat, timestamp, summary FROM memory "
             f"WHERE ({like_clauses}) ORDER BY heat DESC LIMIT ?",
             params + [top_k]
         ).fetchall()
 
     if not rows:
         rows = conn.execute(
-            "SELECT id, raw_link, heat, timestamp, summary FROM memory "
+            "SELECT id, parent_id, raw_link, heat, timestamp, summary FROM memory "
             "ORDER BY heat DESC LIMIT ?",
             (top_k,)
         ).fetchall()
@@ -167,10 +183,11 @@ def search(query: str = "", top_k: int = TOP_K) -> list:
 
     results = []
     for row in rows:
-        rec_id, raw_link, heat, ts, summary = row
+        rec_id, parent_id, raw_link, heat, ts, summary = row
         raw_text = _read_raw(raw_link)
         results.append({
             "id": rec_id,
+            "parent_id": parent_id,
             "heat": round(heat, 2),
             "summary": summary,
             "raw_text": raw_text,
@@ -179,7 +196,77 @@ def search(query: str = "", top_k: int = TOP_K) -> list:
     return results
 
 
-# ────────────────── 锚点（防迷失，继承 V2）──────────────────
+# ────────────────── 链路回溯 ──────────────────
+def trace_chain(record_id: int, depth: int = 5) -> list:
+    """
+    给定一条记忆的 id，顺 parent_id 链向上回溯指定深度。
+    返回从根节点到当前节点的完整上下文链（有序列表）。
+    用于解决"数据膨胀后逻辑断裂"的问题。
+
+    返回格式：
+    [
+        {"id": 1, "parent_id": None,  "summary": "...", "raw_text": "...", "timestamp": ...},
+        {"id": 2, "parent_id": 1,     "summary": "...", "raw_text": "...", "timestamp": ...},
+        {"id": 3, "parent_id": 2,     "summary": "...", "raw_text": "...", "timestamp": ...},
+    ]
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    chain = []
+    current_id = record_id
+
+    for _ in range(depth):
+        row = conn.execute(
+            "SELECT id, parent_id, summary, raw_link, heat, timestamp "
+            "FROM memory WHERE id = ?",
+            (current_id,)
+        ).fetchone()
+        if not row:
+            break
+
+        rec_id, p_id, summary, raw_link, heat, ts = row
+        raw_text = _read_raw(raw_link)
+        chain.append({
+            "id": rec_id,
+            "parent_id": p_id,
+            "summary": summary,
+            "raw_text": raw_text,
+            "heat": round(heat, 2),
+            "timestamp": ts,
+        })
+
+        if p_id is None:
+            # 遇到根节点，停止
+            break
+        current_id = p_id
+
+    conn.close()
+    # 反转：从根节点到当前节点
+    return list(reversed(chain))
+
+
+def get_session_context(session_id: str, depth: int = 5) -> list:
+    """
+    给定 session_id，取该会话链上热度和最高的记忆，向前回溯 depth 轮。
+    用于会话恢复时快速拉取相关上下文。
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    # 找该会话关联的记忆（取最热的一条作为入口）
+    row = conn.execute(
+        "SELECT id FROM memory ORDER BY heat DESC LIMIT 1"
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return []
+    return trace_chain(row[0], depth=depth)
+
+
+# ────────────────── 锚点（防迷失）──────────────────
 def set_anchor(session_id: str, instruction_text: str):
     """在会话开始时存入原始指令锚点"""
     conn = sqlite3.connect(str(DB_PATH))
@@ -278,5 +365,41 @@ if __name__ == "__main__":
         if result["is_drifting"]:
             print(f"[锚点提醒] 原始目标：{result['anchor_text'][:200]}")
 
+    elif cmd == "chain":
+        # 链路回溯：hot_window.py chain <record_id> [depth]
+        rid = int(sys.argv[2])
+        depth = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+        chain = trace_chain(rid, depth=depth)
+        print(f"🔗 链路回溯 depth={depth}，共 {len(chain)} 条\n")
+        for i, node in enumerate(chain):
+            marker = "← 当前" if i == len(chain) - 1 else ""
+            print(f"[{i+1}] id={node['id']} | parent_id={node['parent_id']} | heat={node['heat']} {marker}")
+            print(f"    摘要: {node['summary'][:80]}")
+            print(f"    原文: {node['raw_text'][:200]}")
+            print()
+
+    elif cmd == "context":
+        # 取最热记忆并回溯上下文链
+        depth = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        chain = trace_chain(None, depth=depth) if False else get_session_context("default", depth=depth)
+        # 改为：取热度最高的记录
+        conn = sqlite3.connect(str(DB_PATH))
+        init_db(conn)
+        top_row = conn.execute(
+            "SELECT id FROM memory ORDER BY heat DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not top_row:
+            print("无记忆记录")
+        else:
+            chain = trace_chain(top_row[0], depth=depth)
+            print(f"📋 当前上下文链，共 {len(chain)} 条\n")
+            for i, node in enumerate(chain):
+                marker = "← 当前" if i == len(chain) - 1 else ""
+                print(f"[{i+1}] id={node['id']} | parent_id={node['parent_id']} | heat={node['heat']} {marker}")
+                print(f"    摘要: {node['summary'][:80]}")
+                print(f"    原文: {node['raw_text'][:200]}")
+                print()
+
     else:
-        print("用法: hot_window.py [write|search|reinforce|anchor|drift] [args...]")
+        print("用法: hot_window.py [write|search|reinforce|anchor|drift|chain|context] [args...]")
