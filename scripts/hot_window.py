@@ -379,21 +379,19 @@ if __name__ == "__main__":
             print()
 
     elif cmd == "context":
-        # 取最热记忆并回溯上下文链
+        # 取最新一条记忆并回溯上下文链
         depth = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-        chain = trace_chain(None, depth=depth) if False else get_session_context("default", depth=depth)
-        # 改为：取热度最高的记录
         conn = sqlite3.connect(str(DB_PATH))
         init_db(conn)
         top_row = conn.execute(
-            "SELECT id FROM memory ORDER BY heat DESC LIMIT 1"
+            "SELECT id FROM memory ORDER BY id DESC LIMIT 1"
         ).fetchone()
         conn.close()
         if not top_row:
             print("无记忆记录")
         else:
             chain = trace_chain(top_row[0], depth=depth)
-            print(f"📋 当前上下文链，共 {len(chain)} 条\n")
+            print(f"📋 当前上下文链（最新记忆向前 {depth} 轮），共 {len(chain)} 条\n")
             for i, node in enumerate(chain):
                 marker = "← 当前" if i == len(chain) - 1 else ""
                 print(f"[{i+1}] id={node['id']} | parent_id={node['parent_id']} | heat={node['heat']} {marker}")
