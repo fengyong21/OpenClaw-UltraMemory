@@ -40,10 +40,11 @@ python3 - <<'PYEOF'
 import sqlite3, os
 db = sqlite3.connect("$DB_PATH")
 
-# memory 表（V4）：含 parent_id 父子链
+# memory 表（V4）：含 parent_id 父子链 + SimHash 指纹
 db.execute("""CREATE TABLE IF NOT EXISTS memory (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id INTEGER,
+    simhash   TEXT,
     raw_link  TEXT    NOT NULL,
     heat      REAL    NOT NULL DEFAULT 1,
     timestamp INTEGER NOT NULL,
@@ -60,6 +61,12 @@ try:
 except:
     db.execute("ALTER TABLE memory ADD COLUMN parent_id INTEGER")
     db.execute("CREATE INDEX IF NOT EXISTS idx_parent ON memory(parent_id)")
+
+# 迁移：补充 simhash 列（V4 新增）
+try:
+    db.execute("SELECT simhash FROM memory LIMIT 1")
+except:
+    db.execute("ALTER TABLE memory ADD COLUMN simhash TEXT")
 
 db.execute("""CREATE TABLE IF NOT EXISTS session_anchor (
     session_id TEXT PRIMARY KEY,
@@ -85,7 +92,7 @@ db.execute("""CREATE TABLE IF NOT EXISTS skill_registry (
 )""")
 db.commit()
 db.close()
-print("✅ 数据库初始化完成（V4 schema，含 parent_id 父子链）")
+print("✅ 数据库初始化完成（V4 schema，含 parent_id + SimHash）")
 PYEOF
 
 echo ""
