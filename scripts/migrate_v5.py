@@ -108,15 +108,42 @@ def migrate():
     # 2. 读取 V4 数据
     conn = sqlite3.connect(str(DB_PATH))
 
+    # 检查当前 schema
+    source_table = None
+    rows = []
+
+    # 优先从 memory_v4 表读取（迁移失败遗留）
     try:
         rows = conn.execute("""
             SELECT id, parent_id, simhash, raw_link, heat, timestamp, summary
-            FROM memory
+            FROM memory_v4
         """).fetchall()
-    except sqlite3.OperationalError as e:
-        print(f"⚠️  无法读取 V4 数据: {e}")
-        conn.close()
-        return
+        source_table = "memory_v4"
+    except sqlite3.OperationalError:
+        pass
+
+    # 检查 memory 表是否是 V5 schema（有 meta 列）
+    if not rows:
+        try:
+            conn.execute("SELECT meta FROM memory LIMIT 1")
+            print("✅ 已是 V5 schema，跳过迁移")
+            conn.close()
+            return
+        except sqlite3.OperationalError:
+            pass
+
+        # 是 V4 schema
+        try:
+            rows = conn.execute("""
+                SELECT id, parent_id, simhash, raw_link, heat, timestamp, summary
+                FROM memory
+            """).fetchall()
+            source_table = "memory"
+        except sqlite3.OperationalError:
+            print("📭 未找到 V4 数据，新安装")
+            conn.close()
+            return
+
     conn.close()
 
     if not rows:
@@ -149,21 +176,34 @@ def migrate():
     # 4. 重命名旧表，创建新表
     conn = sqlite3.connect(str(DB_PATH))
 
-    # 重命名旧表
-    conn.execute("ALTER TABLE memory RENAME TO memory_v4")
-    conn.execute("DROP INDEX IF EXISTS idx_heat")
-    conn.execute("DROP INDEX IF EXISTS idx_ts")
-    conn.execute("DROP INDEX IF EXISTS idx_parent")
-    conn.commit()
+    if source_table == "memory_v4":
+        # 已迁移过（memory_v4 存在），只创建 V5 表（如果不存在）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                simhash   TEXT PRIMARY KEY,
+                raw_link  TEXT NOT NULL,
+                meta      TEXT
+            )
+        """)
+    elif source_table == "memory":
+        # 旧 V4 schema，重命名并创建 V5
+        try:
+            conn.execute("DROP TABLE IF EXISTS memory_v4")  # 清理旧的
+            conn.execute(f"ALTER TABLE {source_table} RENAME TO memory_v4")
+            conn.execute("DROP INDEX IF EXISTS idx_heat")
+            conn.execute("DROP INDEX IF EXISTS idx_ts")
+            conn.execute("DROP INDEX IF EXISTS idx_parent")
+        except sqlite3.OperationalError:
+            pass
 
-    # 创建 V5 新表
-    conn.execute("""
-        CREATE TABLE memory (
-            simhash   TEXT PRIMARY KEY,
-            raw_link  TEXT NOT NULL,
-            meta      TEXT
-        )
-    """)
+        # 创建 V5 新表
+        conn.execute("""
+            CREATE TABLE memory (
+                simhash   TEXT PRIMARY KEY,
+                raw_link  TEXT NOT NULL,
+                meta      TEXT
+            )
+        """)
     conn.commit()
 
     # 5. 写入 V5 数据
