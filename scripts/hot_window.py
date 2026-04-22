@@ -359,6 +359,33 @@ def write_memory(text: str, parent_id: int = None, session_id: str = None) -> di
     return {"simhash": sh, "raw_link": str(raw_path), "timestamp": ts}
 
 
+# ────────────────── 技能生长联动（草稿版）─────────────────
+def check_skill_generation(record_id: int, raw_text: str, session_id: str = None):
+    """
+    检查是否应该生成技能（草稿版）。
+    当前只做基础检查：
+    1. 文本长度 >= 200
+    2. 有代码块（简单验证）
+    3. 和现有 skill 不重复
+    """
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from auto_skill import on_reinforce, _text_similarity
+
+        # 基础检查：长度 + 代码块
+        if len(raw_text) < 200:
+            return None
+        if "```" not in raw_text and "def " not in raw_text and "class " not in raw_text:
+            return None  # 没有代码/函数，可能不是技术方案
+
+        on_reinforce(record_id, raw_text)
+        return True
+    except ImportError:
+        # auto_skill 未安装，跳过
+        return None
+
+
 # ────────────────── 检索 ──────────────────
 def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False, anchor_boost: bool = True) -> list:
     """
@@ -509,7 +536,8 @@ def _trace_by_timestamp(timestamp: int, depth: int = 5) -> list:
 
         found = False
         for raw_file in RAW_DIR.glob("*.md"):
-            content = open(raw_file, encoding="utf-8").read()
+            with open(raw_file, encoding="utf-8") as f:
+                content = f.read()
 
             # V5 JSON 格式
             if content.strip().startswith("{"):
@@ -573,7 +601,8 @@ def trace_chain(record_id: int = None, depth: int = 5) -> list:
 
         found = False
         for raw_file in RAW_DIR.glob("*.md"):
-            content = open(raw_file, encoding="utf-8").read()
+            with open(raw_file, encoding="utf-8") as f:
+                content = f.read()
 
             # 尝试 JSON 格式（V5）
             if content.strip().startswith("{"):
@@ -860,33 +889,4 @@ Claw Memory V5 - 精简 L2 + 进阶级 SimHash + 防迷失锚点
         print(f"未知命令: {cmd}")
         print("用法: hot_window.py [write|search|chain|migrate|stats|help]")
 
-# ────────────────── 技能生长联动（草稿版）─────────────────
-# 后续优化方向：
-# - 质量打分（长度/代码块/关键词）
-# - 锚点验证（多轮会话才生成）
-# - 草稿模式（用户确认后才激活）
 
-def check_skill_generation(record_id: int, raw_text: str, session_id: str = None):
-    """
-    检查是否应该生成技能（草稿版）。
-    当前只做基础检查：
-    1. 文本长度 >= 200
-    2. 有代码块（简单验证）
-    3. 和现有 skill 不重复
-    """
-    try:
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent))
-        from auto_skill import on_reinforce, _text_similarity
-
-        # 基础检查：长度 + 代码块
-        if len(raw_text) < 200:
-            return None
-        if "```" not in raw_text and "def " not in raw_text and "class " not in raw_text:
-            return None  # 没有代码/函数，可能不是技术方案
-
-        on_reinforce(record_id, raw_text)
-        return True
-    except ImportError:
-        # auto_skill 未安装，跳过
-        return None
