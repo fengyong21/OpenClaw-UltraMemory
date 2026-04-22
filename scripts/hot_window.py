@@ -250,13 +250,18 @@ def write_memory(text: str, parent_id: int = None) -> dict:
 
 
 # ────────────────── 检索 ──────────────────
-def search(query: str = "", top_k: int = TOP_K) -> list:
+def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False) -> list:
     """
     两层检索（V5 精简版）：
     第1层：关键词初筛（兼容 V4/V5 raw 格式）
     第2层：SimHash 语义搜索（多粒度 + 加权，阈值放宽）
 
     策略：先用关键词快速定位候选，再用 simhash 精排
+
+    参数：
+      query: 检索词
+      top_k: 返回条数
+      include_chain: 是否在结果中包含父节点上下文链
     """
     if not query.strip():
         return []
@@ -316,10 +321,87 @@ def search(query: str = "", top_k: int = TOP_K) -> list:
     # 按分数排序
     candidates.sort(key=lambda x: -x["score"])
 
-    return candidates[:top_k]
+    results = candidates[:top_k]
+
+    # 可选：带上父节点上下文链
+    if include_chain:
+        for result in results:
+            ts = result["timestamp"]
+            chain = _trace_by_timestamp(ts, depth=3)
+            if chain:
+                result["chain"] = chain
+
+    return results
 
 
 # ────────────────── 链路回溯 ──────────────────
+def _trace_by_timestamp(timestamp: int, depth: int = 5) -> list:
+    """
+    通过 timestamp 回溯父节点链。
+    返回从父节点到当前节点的上下文链。
+    """
+    chain = []
+
+    # 获取这条记忆的 parent_id
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    row = conn.execute(
+        "SELECT meta FROM memory WHERE JSON_EXTRACT(meta, '$.timestamp') = ?",
+        (timestamp,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return []
+
+    meta = json.loads(row[0]) if row[0] else {}
+    current_parent = meta.get("parent_id")
+
+    if current_parent is None:
+        return []
+
+    # 回溯 parent 链
+    for _ in range(depth):
+        if current_parent is None:
+            break
+
+        found = False
+        for raw_file in RAW_DIR.glob("*.md"):
+            content = open(raw_file, encoding="utf-8").read()
+
+            # V5 JSON 格式
+            if content.strip().startswith("{"):
+                for line in content.split("\n"):
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("ts") == current_parent or entry.get("parent_id") == current_parent:
+                            chain.append(entry)
+                            current_parent = entry.get("parent_id")
+                            found = True
+                            break
+                    except:
+                        continue
+            else:
+                # V4 Markdown 格式：找对应的 timestamp
+                lines = content.split("\n")
+                for i, line in enumerate(lines):
+                    if line.startswith("## ") and str(timestamp) in line:
+                        # 找到了，回溯更早的
+                        if i > 0 and lines[i-1].startswith("---"):
+                            # 这是 V4 格式的迁移文件
+                            pass
+                        found = True
+                        break
+
+            if found:
+                break
+
+        if not found:
+            break
+
+    return chain
+
+
 def trace_chain(record_id: int = None, depth: int = 5) -> list:
     """
     给定一条记忆，回溯 parent_id 链。
@@ -543,13 +625,19 @@ if __name__ == "__main__":
 
     elif cmd == "search":
         query = sys.argv[2] if len(sys.argv) > 2 else ""
+        include_chain = "--chain" in sys.argv
         if not query:
-            print("用法: hot_window.py search <关键词或问题描述>")
+            print("用法: hot_window.py search <查询> [--chain]")
+            print("  --chain: 显示每条结果的父节点上下文链")
         else:
-            results = search(query)
+            results = search(query, include_chain=include_chain)
             print(f"🔍 检索「{query}」→ {len(results)} 条结果\n")
             for i, r in enumerate(results, 1):
-                print(f"[{i}] 距离={r['distance']} | {r['raw_text'][:80]}...")
+                print(f"[{i}] {r['layer']} | 距离={r['distance']} | {r['raw_text'][:80]}...")
+                if include_chain and r.get("chain"):
+                    print(f"    └─ 上下文链 {len(r['chain'])} 条:")
+                    for j, node in enumerate(r["chain"][:3]):
+                        print(f"       [{j+1}] {node.get('text', '')[:50]}...")
                 print()
 
     elif cmd == "chain":
@@ -573,7 +661,7 @@ Claw Memory V5 - 精简 L2 + 进阶级 SimHash
 
 用法:
   hot_window.py write <文本> [parent_id]   写入记忆
-  hot_window.py search <查询>              检索记忆
+  hot_window.py search <查询> [--chain]   检索记忆（带上下文链）
   hot_window.py chain [record_id] [depth]  链路回溯
   hot_window.py migrate                    V4 → V5 迁移
   hot_window.py stats                      统计信息

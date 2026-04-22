@@ -49,6 +49,9 @@ python3 hot_window.py write "对话内容"
 # 检索记忆（关键词 + SimHash 混合检索）
 python3 hot_window.py search "关键词或问题描述"
 
+# 检索记忆（带上下文链）
+python3 hot_window.py search "关键词" --chain
+
 # 链路回溯（追溯父子链）
 python3 hot_window.py chain [record_id] [depth]
 
@@ -96,12 +99,19 @@ hot_window.db (V5 schema):
 用户输入 → is_task_input() 判断是否任务
          → 如果是：search() 检索相关记忆
          → 读取 raw 文件补全内容
+         → 追溯 parent_id 链获取完整上下文
          → 带着上下文回答
 
 新对话 → write_memory() 归档
         → 计算多粒度 SimHash
-        → 更新 L2 索引
+        → 写入 L2 索引
+        → 关联 parent_id 形成链路
 ```
+
+**search + trace_chain 组合**：
+- 检索命中后，自动追溯父节点上下文
+- 返回完整对话链，不只是单条记忆
+- 解决"断章取义"问题
 
 ---
 
