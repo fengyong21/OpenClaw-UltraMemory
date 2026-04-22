@@ -50,12 +50,21 @@ STOPWORDS = {
 
 # ────────────────── 初始化 DB（精简版 schema）─────────────────
 def init_db(conn: sqlite3.Connection):
-    """V5 精简 schema：只保留 simhash + raw_link"""
+    """V5 精简 schema + session_anchor 防迷失"""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS memory (
             simhash   TEXT PRIMARY KEY,  -- 多粒度加权 SimHash
             raw_link  TEXT NOT NULL,    -- 原材料文件路径
-            meta      TEXT              -- JSON 编码的元信息（parent_id, timestamp）
+            meta      TEXT              -- JSON：parent_id, timestamp, session_id
+        )
+    """)
+    # session_anchor 表：会话锚点，防迷失机制的核心
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_anchor (
+            session_id TEXT PRIMARY KEY,     -- 会话唯一ID（UUID）
+            instruction_text TEXT NOT NULL,  -- 入口指令原文
+            instruction_hash TEXT NOT NULL, -- 入口指令指纹
+            created_at INTEGER NOT NULL     -- 创建时间戳
         )
     """)
     # 旧表迁移：如果存在 V4 的旧表，重命名为 backup
@@ -206,21 +215,121 @@ def is_task_input(text: str) -> bool:
     return False
 
 
+# ────────────────── 会话锚点（防迷失）─────────────────
+import uuid
+
+def start_session(instruction_text: str) -> dict:
+    """
+    开启新会话，注册锚点。
+    用于新话题/新任务开始时调用，让 AI 永远知道"我从哪来"。
+
+    返回：session_id, instruction_hash, created_at
+    """
+    import hashlib
+    ts = int(time.time())
+    session_id = str(uuid.uuid4())[:8]  # 短 UUID
+    # 用内容 hash，而非 simhash（simhash 是语义指纹，这个是指令指纹）
+    instruction_hash = hashlib.md5(instruction_text.encode()).hexdigest()[:16]
+
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO session_anchor (session_id, instruction_text, instruction_hash, created_at) VALUES (?, ?, ?, ?)",
+        (session_id, instruction_text[:200], instruction_hash, ts)
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "session_id": session_id,
+        "instruction_hash": instruction_hash,
+        "created_at": ts,
+    }
+
+
+def get_current_session() -> dict:
+    """
+    获取当前活跃会话（最新创建的锚点）。
+    如果没有，返回 None。
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    row = conn.execute(
+        "SELECT session_id, instruction_text, instruction_hash, created_at FROM session_anchor ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "session_id": row[0],
+        "instruction_text": row[1],
+        "instruction_hash": row[2],
+        "created_at": row[3],
+    }
+
+
+def get_session_records(session_id: str = None) -> list:
+    """
+    获取指定会话的所有记忆记录。
+    用于"回到这个会话"的上下文重建。
+    """
+    if not session_id:
+        sess = get_current_session()
+        if not sess:
+            return []
+        session_id = sess["session_id"]
+
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    # 通过 meta JSON 中的 session_id 筛选
+    rows = conn.execute(
+        "SELECT simhash, raw_link, meta FROM memory WHERE JSON_EXTRACT(meta, '$.session_id') = ?",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+
+    results = []
+    for simhash, raw_link, meta_json in rows:
+        meta = json.loads(meta_json) if meta_json else {}
+        raw_text = _read_raw(raw_link)
+        results.append({
+            "simhash": simhash,
+            "raw_link": raw_link,
+            "raw_text": raw_text[:200],
+            "timestamp": meta.get("timestamp", 0),
+            "session_id": meta.get("session_id"),
+        })
+
+    return sorted(results, key=lambda x: x["timestamp"])
+
+
 # ────────────────── 写入 ──────────────────
-def write_memory(text: str, parent_id: int = None) -> dict:
+def write_memory(text: str, parent_id: int = None, session_id: str = None) -> dict:
     """
     归档一段对话文本。
     1. 原文追加到 raw/YYYY-MM-DD.md（无损只追加）
     2. 计算进阶级 SimHash（多粒度 + 加权）
     3. 写入精简索引（simhash + raw_link + meta）
+    4. 自动关联当前 session（如果没有显式传入）
     """
     today = datetime.now().strftime("%Y-%m-%d")
     raw_path = RAW_DIR / f"{today}.md"
 
     ts = int(time.time())
+
+    # 自动关联当前 session
+    if not session_id:
+        sess = get_current_session()
+        if sess:
+            session_id = sess["session_id"]
+
     meta = {
         "timestamp": ts,
         "parent_id": parent_id,
+        "session_id": session_id,  # V5 新增：会话关联
     }
 
     # 追加到 raw 文件
@@ -228,6 +337,7 @@ def write_memory(text: str, parent_id: int = None) -> dict:
         entry = {
             "ts": ts,
             "parent_id": parent_id,
+            "session_id": session_id,
             "text": text,
         }
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -250,24 +360,30 @@ def write_memory(text: str, parent_id: int = None) -> dict:
 
 
 # ────────────────── 检索 ──────────────────
-def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False) -> list:
+def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False, anchor_boost: bool = True) -> list:
     """
-    两层检索（V5 精简版）：
+    三层检索（V5 精简版 + 锚点引导）：
     第1层：关键词初筛（兼容 V4/V5 raw 格式）
     第2层：SimHash 语义搜索（多粒度 + 加权，阈值放宽）
+    第3层：锚点引导（同 session 记录获得额外分数）
 
-    策略：先用关键词快速定位候选，再用 simhash 精排
+    策略：关键词快速定位 → simhash 精排 → 锚点加权
 
     参数：
       query: 检索词
       top_k: 返回条数
       include_chain: 是否在结果中包含父节点上下文链
+      anchor_boost: 是否启用锚点引导（同 session +5 分）
     """
     if not query.strip():
         return []
 
     conn = sqlite3.connect(str(DB_PATH))
     init_db(conn)
+
+    # 获取当前 session（锚点引导用）
+    current_session = get_current_session()
+    current_session_id = current_session["session_id"] if current_session else None
 
     query_hash = _compute_simhash(query)
     keywords = _extract_keywords(query)
@@ -282,6 +398,7 @@ def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False) -> 
     for simhash, raw_link, meta_json in rows:
         meta = json.loads(meta_json) if meta_json else {}
         raw_text = _read_raw(raw_link)
+        record_session_id = meta.get("session_id")
 
         # 计算相似度分数
         score = 0
@@ -306,6 +423,11 @@ def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False) -> 
                 if layer is None:
                     layer = "simhash"
 
+        # 第3层：锚点引导（如果启用）
+        if anchor_boost and record_session_id and record_session_id == current_session_id:
+            score += 5  # 同 session 额外加分
+            layer = f"{layer}+anchor" if layer else "anchor"
+
         if score > 0:
             candidates.append({
                 "simhash": simhash,
@@ -314,6 +436,7 @@ def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False) -> 
                 "raw_text": raw_text,
                 "timestamp": meta.get("timestamp", 0),
                 "parent_id": meta.get("parent_id"),
+                "session_id": record_session_id,
                 "score": score,
                 "layer": layer or "unknown",
             })
@@ -322,6 +445,15 @@ def search(query: str = "", top_k: int = TOP_K, include_chain: bool = False) -> 
     candidates.sort(key=lambda x: -x["score"])
 
     results = candidates[:top_k]
+
+    # 添加锚点上下文（当前会话的入口指令）
+    if current_session:
+        for result in results:
+            result["anchor_context"] = {
+                "session_id": current_session["session_id"],
+                "instruction_text": current_session["instruction_text"],
+                "is_current_session": result.get("session_id") == current_session["session_id"],
+            }
 
     # 可选：带上父节点上下文链
     if include_chain:
@@ -601,6 +733,10 @@ def stats():
     init_db(conn)
     count = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
 
+    # session_anchor 统计
+    session_count = conn.execute("SELECT COUNT(*) FROM session_anchor").fetchone()[0]
+    current = get_current_session()
+
     # 统计 raw 文件
     raw_count = len(list(RAW_DIR.glob("*.md"))) if RAW_DIR.exists() else 0
 
@@ -609,7 +745,10 @@ def stats():
     print(f"📊 记忆统计")
     print(f"  - 索引条数: {count}")
     print(f"  - raw 文件: {raw_count}")
-    print(f"  - schema: simhash + raw_link + meta (V5 精简版)")
+    print(f"  - 会话锚点: {session_count} 个")
+    if current:
+        print(f"  - 当前会话: {current['session_id']}「{current['instruction_text'][:30]}...」")
+    print(f"  - schema: simhash + raw_link + meta + session_id (V5)")
 
 
 # ────────────────── CLI 入口 ──────────────────
@@ -648,6 +787,42 @@ if __name__ == "__main__":
         for i, node in enumerate(chain):
             print(f"[{i+1}] parent={node.get('parent_id')} | {node.get('text', '')[:60]}...")
 
+    elif cmd == "session":
+        # session 管理
+        sub = sys.argv[2] if len(sys.argv) > 2 else "current"
+        if sub == "start":
+            # 开启新会话
+            instruction = sys.argv[3] if len(sys.argv) > 3 else input("入口指令: ")
+            result = start_session(instruction)
+            print(f"🆕 新会话开启: {result['session_id']}")
+            print(f"   入口: {instruction[:50]}...")
+            print(f"   指纹: {result['instruction_hash']}")
+        elif sub == "current":
+            # 显示当前会话
+            sess = get_current_session()
+            if sess:
+                print(f"📍 当前会话: {sess['session_id']}")
+                print(f"   入口: {sess['instruction_text']}")
+                print(f"   创建于: {datetime.fromtimestamp(sess['created_at'])}")
+                # 显示该会话的所有记录
+                records = get_session_records(sess['session_id'])
+                print(f"   记录数: {len(records)} 条")
+            else:
+                print("📭 当前没有活跃会话")
+                print("   用法: hot_window.py session start <入口指令>")
+        elif sub == "list":
+            # 列出所有会话
+            conn = sqlite3.connect(str(DB_PATH))
+            init_db(conn)
+            rows = conn.execute("SELECT session_id, instruction_text, created_at FROM session_anchor ORDER BY created_at DESC LIMIT 10").fetchall()
+            conn.close()
+            print(f"📜 最近 {len(rows)} 个会话:\n")
+            for sid, text, ts in rows:
+                print(f"  [{sid}] {datetime.fromtimestamp(ts)} | {text[:40]}...")
+        else:
+            print(f"未知子命令: {sub}")
+            print("用法: session [start|current|list]")
+
     elif cmd == "migrate":
         print("🚀 开始 V4 → V5 迁移...")
         migrate_from_v4()
@@ -657,12 +832,15 @@ if __name__ == "__main__":
 
     elif cmd == "help":
         print("""
-Claw Memory V5 - 精简 L2 + 进阶级 SimHash
+Claw Memory V5 - 精简 L2 + 进阶级 SimHash + 防迷失锚点
 
 用法:
-  hot_window.py write <文本> [parent_id]   写入记忆
-  hot_window.py search <查询> [--chain]   检索记忆（带上下文链）
+  hot_window.py write <文本> [parent_id]   写入记忆（自动关联当前 session）
+  hot_window.py search <查询> [--chain]   检索记忆（带锚点引导）
   hot_window.py chain [record_id] [depth]  链路回溯
+  hot_window.py session start <指令>        开启新会话（防迷失）
+  hot_window.py session current            显示当前会话
+  hot_window.py session list               列出最近会话
   hot_window.py migrate                    V4 → V5 迁移
   hot_window.py stats                      统计信息
   hot_window.py help                       显示帮助
